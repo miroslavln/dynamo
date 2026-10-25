@@ -13,6 +13,9 @@ pub(super) struct RemoveOutcome {
     pub(super) stale_hashes: Vec<ExternalSequenceBlockHash>,
 }
 
+/// A leaf edge grows to at most `len + len / LEAF_SLACK_DIVISOR` when it reallocates.
+const LEAF_SLACK_DIVISOR: usize = 8;
+
 /// A node's compressed edge, its position index, and which workers cover how much of it.
 #[derive(Debug)]
 pub(super) struct CrtcNodeState {
@@ -222,6 +225,13 @@ impl CrtcNodeState {
         }
         self.promote_to_full(worker);
 
+        // Decode extends a leaf a few blocks at a time, so `Vec`'s doubling would leave
+        // up to half of a long edge unused. Grow by an eighth instead.
+        let new_len = old_len + blocks.len();
+        if new_len > self.edge.capacity() {
+            self.edge
+                .reserve_exact(new_len + new_len / LEAF_SLACK_DIVISOR - old_len);
+        }
         self.edge.extend(
             blocks
                 .iter()
@@ -242,6 +252,8 @@ impl CrtcNodeState {
         );
 
         let suffix_edge = self.edge.split_off(pos);
+        // The prefix becomes internal and never grows again, so drop the capacity it kept.
+        self.edge.shrink_to_fit();
         self.edge_index.truncate(&self.edge);
 
         let suffix_full = self.full_edge_workers.clone();
@@ -402,6 +414,35 @@ mod tests {
         let mut state = CrtcNodeState::for_blocks(&blocks(&edge), worker);
         let _suffix = state.split_off_suffix(split);
         assert!(state.edge_index.capacity() > 0);
+        assert_position_near_matches_index(&state);
+    }
+
+    #[test]
+    fn split_prefix_keeps_no_spare_capacity() {
+        let worker = worker(1);
+        let edge: Vec<u64> = (1..=64).collect();
+        let mut state = CrtcNodeState::for_blocks(&blocks(&edge), worker);
+        state.edge.reserve(64);
+
+        let suffix = state.split_off_suffix(16);
+
+        assert_eq!(state.edge.capacity(), 16);
+        assert_eq!(suffix.edge.capacity(), 48);
+    }
+
+    #[test]
+    fn leaf_extension_bounds_spare_capacity() {
+        let worker = worker(1);
+        let mut state = CrtcNodeState::for_blocks(&blocks(&[100]), worker);
+        for hash in 101..4196 {
+            state.append_blocks_to_leaf(worker, &blocks(&[hash]));
+            let len = state.edge.len();
+            assert!(
+                state.edge.capacity() <= len + len / LEAF_SLACK_DIVISOR + 1,
+                "capacity {} for length {len}",
+                state.edge.capacity()
+            );
+        }
         assert_position_near_matches_index(&state);
     }
 
